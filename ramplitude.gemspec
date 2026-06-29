@@ -17,8 +17,11 @@ Gem::Specification.new do |spec|
 
   spec.metadata["homepage_uri"]    = spec.homepage
   spec.metadata["source_code_uri"] = spec.homepage
+  # Custom property: machine-readable orientation doc for LLM agents wiring
+  # this gem into a codebase. https://llmstxt.org/
+  spec.metadata["llms_txt_uri"]    = "#{spec.homepage}/blob/main/llms.txt"
 
-  spec.files = Dir["lib/**/*.rb", "README.md", "LICENSE.txt", "CHANGELOG.md"]
+  spec.files = Dir["lib/**/*.rb", "README.md", "LICENSE.txt", "CHANGELOG.md", "llms.txt"]
   spec.require_paths = ["lib"]
 
   spec.add_development_dependency "minitest", "~> 5.20"

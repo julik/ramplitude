@@ -1,0 +1,220 @@
+# Ramplitude
+
+> Unofficial Ruby gem that posts events to Amplitude analytics. Port of the
+> official Amplitude Python SDK with a Sink/Uploader split so events can be
+> buffered in-memory, in Redis, or anywhere else, then flushed in-process or
+> from a background job (Sidekiq, ActiveJob, cron, etc.).
+
+Not affiliated with Amplitude, Inc. "Amplitude" is their trademark.
+
+## When to use this gem
+
+- The host application needs to send analytics events to Amplitude.
+- The codebase is Ruby (3.0+).
+- For Rails apps that must keep request paths free of HTTP I/O, prefer the
+  Redis + ActiveJob recipe below over the default in-process uploader.
+
+## Install
+
+Add to the host application's Gemfile:
+
+```ruby
+gem "ramplitude"
+gem "redis"            # only if using the Redis sink
+gem "connection_pool"  # recommended for the Redis sink in multi-threaded apps
+```
+
+Then `bundle install`. The gem has no runtime dependencies beyond stdlib.
+
+## Configuration surface (Ramplitude::Config)
+
+| Option              | Type     | Default                | Purpose |
+| ------------------- | -------- | ---------------------- | --- |
+| `api_key`           | String   | required               | Amplitude project API key |
+| `flush_queue_size`  | Integer  | 200                    | Events per batch |
+| `flush_interval_ms` | Integer  | 10_000                 | Consumer wake-up interval (in-process uploader only) |
+| `flush_max_retries` | Integer  | 12                     | Per-event retry cap before drop |
+| `server_zone`       | Symbol   | `:us`                  | `:us` or `:eu` |
+| `use_batch`         | Boolean  | `false`                | Use `/batch` endpoint instead of `/2/httpapi` |
+| `server_url`        | String   | derived                | Override endpoint entirely |
+| `min_id_length`     | Integer  | nil                    | Override Amplitude's 5-char minimum |
+| `on_event`          | Proc     | nil                    | `->(event, code, message)` callback for every result |
+| `sink`              | Sink     | `Sinks::InMemory.new`  | Where events sit before upload |
+| `uploader`          | Uploader | `Uploaders::Threaded.new` | Who drains the sink |
+| `plan`              | Plan     | nil                    | Tracking plan metadata |
+| `ingestion_metadata`| object   | nil                    | Ingestion metadata |
+| `logger`            | Logger   | stdout                 | Where warnings/errors go |
+
+## Recipe 1 — Default in-process (scripts, workers, small services)
+
+```ruby
+require "ramplitude"
+
+amplitude = Ramplitude::Client.new(api_key: ENV.fetch("AMPLITUDE_API_KEY"))
+
+amplitude.track("Page Viewed", user_id: "u-1", event_properties: { path: "/" })
+amplitude.identify(user_id: "u-1") { |i| i.set(:plan, "pro").add(:logins, 1) }
+amplitude.revenue(user_id: "u-1", price: 9.99, quantity: 1, product_id: "sku-42")
+amplitude.set_group("org_id", "15", user_id: "u-1")
+
+amplitude.flush.wait   # optional; at_exit also flushes
+amplitude.shutdown
+```
+
+Threading note: NO threads spawn until the first `track`/`identify`/etc.
+call. After that, 1 consumer + 4 worker threads (configurable via
+`Uploaders::Threaded.new(pool_size: N)`) drain the in-memory sink in the
+background.
+
+## Recipe 2 — Module-level singleton (one Amplitude project per process)
+
+```ruby
+# config/initializers/ramplitude.rb (Rails) or boot script
+Ramplitude.configure do |c|
+  c.api_key   = ENV.fetch("AMPLITUDE_API_KEY")
+  c.server_zone = :eu                # if applicable
+  c.use_batch = true                 # better for high-volume
+end
+
+# Anywhere in the app:
+Ramplitude.track("Checkout Completed", user_id: user.id.to_s,
+                 event_properties: { cents: order.total_cents })
+```
+
+## Recipe 3 — Production Rails: Redis sink + ActiveJob drainer
+
+Keeps web requests free of any HTTP I/O. Web workers push events to Redis;
+a periodic ActiveJob bulk-uploads them.
+
+```ruby
+# config/initializers/ramplitude.rb
+require "ramplitude"
+require "connection_pool"
+
+REDIS_POOL = ConnectionPool.new(size: 10, timeout: 5) do
+  Redis.new(url: ENV.fetch("REDIS_URL"))
+end
+
+Ramplitude.configure do |c|
+  c.api_key   = ENV.fetch("AMPLITUDE_API_KEY")
+  c.sink      = Ramplitude::Sinks::Redis.new(redis: REDIS_POOL, key: "ramp:events")
+  c.uploader  = Ramplitude::Uploaders::Null.new   # web does not drain
+  c.use_batch = true
+end
+```
+
+```ruby
+# app/jobs/ramplitude_flush_job.rb
+class RamplitudeFlushJob < ApplicationJob
+  queue_as :ramplitude
+
+  def perform(max_batches: 50)
+    Ramplitude::BulkFlusher.new(
+      api_key: ENV.fetch("AMPLITUDE_API_KEY"),
+      sink:    Ramplitude::Sinks::Redis.new(redis: REDIS_POOL, key: "ramp:events"),
+      config:  Ramplitude::Config.new(use_batch: true, flush_queue_size: 1000),
+    ).drain(max_batches: max_batches)
+  end
+end
+```
+
+Schedule with whatever scheduler the host app already uses (solid_queue
+recurring, sidekiq-cron, whenever, etc.) — every 60 seconds is usually fine.
+
+The Redis sink accepts a bare `Redis` client OR a `ConnectionPool` — it
+detects via `respond_to?(:with)` and wraps a bare client in a `NullPool` so
+every Redis command uniformly checks out a connection. Concurrent
+RamplitudeFlushJob runs are safe — `pull` uses a Lua script (`ZRANGEBYSCORE` +
+`ZREM`) for atomic batch dequeue.
+
+## Event shapes
+
+`track` accepts three forms:
+
+```ruby
+client.track("Button Clicked", user_id: "u-1", event_properties: { color: "red" })
+client.track("Button Clicked") { |e| e.user_id = "u-1"; e.platform = "web" }
+client.track(Ramplitude::Event.new(event_type: "Click", user_id: "u-1"))
+```
+
+`identify` builds user-property operations:
+
+```ruby
+client.identify(user_id: "u-1") do |i|
+  i.set        :plan, "pro"
+  i.set_once   :first_seen_at, Time.now.iso8601
+  i.add        :login_count, 1            # numeric only
+  i.append     :badges, "early-adopter"
+  i.prepend    :recent_pages, "/home"
+  i.pre_insert :tags, "vip"
+  i.post_insert :tags, "trial"
+  i.remove     :badges, "beta"
+  i.unset      :deprecated_field
+  i.clear_all                              # nuke everything
+end
+```
+
+`revenue`:
+
+```ruby
+client.revenue(user_id: "u-1",
+               price: 9.99, quantity: 2, product_id: "sku-42",
+               revenue_type: "purchase", currency: "USD")
+```
+
+`set_group` / `group_identify`:
+
+```ruby
+client.set_group("org_id", "15", user_id: "u-1")
+client.group_identify("org_id", "15", user_id: "u-1") { |i| i.set(:locale, "en-us") }
+```
+
+## Plugins
+
+Three pipeline stages: BEFORE → ENRICHMENT → DESTINATION. Return `nil` from
+an enrichment plugin to drop the event.
+
+Block sugar for simple cases:
+
+```ruby
+client.before { |e| e.platform ||= "web"; e }
+client.enrich { |e| e.event_properties&.delete(:email); e }
+```
+
+Class form for testable / reusable plugins:
+
+```ruby
+class StripPII < Ramplitude::Plugin::EventPlugin
+  def initialize; super(Ramplitude::PluginType::ENRICHMENT); end
+  def execute(event)
+    event.event_properties&.delete(:email)
+    event
+  end
+end
+client.add(StripPII.new)
+```
+
+## Behaviours an agent should NOT change
+
+1. Don't bypass the Sink — `track` is the only entry point that runs plugins.
+2. Don't share a single `Redis` client across many threads without a pool.
+3. Don't call `flush.wait` from inside a request — it can block on HTTP.
+4. Don't disable gzip unless debugging — bodies >= 1 KiB are compressed
+   automatically and Amplitude prefers it.
+
+## Common pitfalls
+
+- Events without `user_id` AND without `device_id` are silently dropped.
+- `Identify#add` raises `InvalidEventError` if the value isn't `Numeric`.
+- The default in-memory sink loses events on process crash. For durability,
+  switch to `Sinks::Redis`.
+- The Redis sink ZSET key (`amplitude:events` by default) MUST be unique
+  per Amplitude project if multiple clients write to the same Redis.
+
+## Resources
+
+- Repository:   https://github.com/julik/ramplitude
+- Port plan:    https://github.com/julik/ramplitude/blob/main/llm/plans/port-plan.md
+- Reference:    Amplitude HTTP API v2 — https://amplitude.com/docs/apis/analytics/http-v2
+- Batch API:    https://amplitude.com/docs/apis/analytics/batch-event-upload
+- Upstream SDK: https://github.com/amplitude/Amplitude-Python
