@@ -1,0 +1,31 @@
+# Bundler / RubyGems
+/.bundle/
+/vendor/bundle/
+/pkg/
+/tmp/
+*.gem
+Gemfile.lock
+
+# Test / coverage
+/coverage/
+/.yardoc/
+/_yardoc/
+/doc/
+/rdoc/
+
+# Editors & OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
