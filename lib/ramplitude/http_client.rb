@@ -3,6 +3,8 @@
 require "net/http"
 require "uri"
 require "json"
+require "stringio"
+require "zlib"
 
 module Ramplitude
   module HttpStatus
@@ -70,13 +72,21 @@ module Ramplitude
   end
 
   class HttpClient
-    def self.post(url, payload, headers: nil)
+    # Bodies smaller than this aren't worth compressing — the gzip header
+    # overhead would dominate. 1 KiB is the conventional cutoff.
+    GZIP_MIN_BYTES = 1024
+
+    def self.post(url, payload, headers: nil, gzip: true)
       uri = URI(url)
       req = Net::HTTP::Post.new(uri.request_uri)
-      req["Content-Type"] = "application/json; charset=UTF-8"
-      req["Accept"]       = "*/*"
+      req["Content-Type"]    = "application/json; charset=UTF-8"
+      req["Accept"]          = "*/*"
+      req["Accept-Encoding"] = "gzip"
       headers&.each { |k, v| req[k] = v }
-      req.body = payload
+
+      body, encoding = maybe_gzip(payload, gzip)
+      req["Content-Encoding"] = encoding if encoding
+      req.body = body
 
       http = Net::HTTP.new(uri.host, uri.port)
       http.use_ssl = uri.scheme == "https"
@@ -85,12 +95,33 @@ module Ramplitude
 
       begin
         res = http.request(req)
-        Response.parse(res.code.to_i, res.body)
+        Response.parse(res.code.to_i, decode_body(res))
       rescue Net::OpenTimeout, Net::ReadTimeout
         Response.new(status: HttpStatus::TIMEOUT, code: 408, body: { "error" => "timeout" })
       rescue StandardError => e
         Response.new(status: HttpStatus::UNKNOWN, code: -1, body: { "error" => e.message })
       end
+    end
+
+    def self.maybe_gzip(payload, gzip)
+      bytes = payload.bytesize
+      return [payload, nil] unless gzip && bytes >= GZIP_MIN_BYTES
+
+      buf = StringIO.new(+"".b)
+      gz  = Zlib::GzipWriter.new(buf)
+      gz.write(payload)
+      gz.close
+      [buf.string, "gzip"]
+    end
+
+    # Net::HTTP normally inflates gzipped responses for you, BUT only when it
+    # sets the Accept-Encoding header itself. We set it explicitly, which
+    # disables that auto-decode — so we decode the body ourselves.
+    def self.decode_body(res)
+      return res.body unless res["content-encoding"].to_s.downcase.include?("gzip")
+      Zlib::GzipReader.new(StringIO.new(res.body)).read
+    rescue Zlib::GzipFile::Error
+      res.body
     end
   end
 end

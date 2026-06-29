@@ -47,4 +47,53 @@ class HttpClientTest < Minitest::Test
     # to_timeout raises a generic timeout; map to UNKNOWN or TIMEOUT — accept either.
     assert_includes [Ramplitude::HttpStatus::TIMEOUT, Ramplitude::HttpStatus::UNKNOWN], res.status
   end
+
+  def test_small_body_is_not_gzipped
+    captured = nil
+    stub_request(:post, URL).with { |req| captured = req; true }
+      .to_return(status: 200, body: "{}")
+
+    Ramplitude::HttpClient.post(URL, "{}")
+    assert_nil captured.headers["Content-Encoding"]
+    assert_equal "{}", captured.body
+  end
+
+  def test_large_body_is_gzipped
+    captured = nil
+    stub_request(:post, URL).with { |req| captured = req; true }
+      .to_return(status: 200, body: "{}")
+
+    big = "x" * 4096
+    Ramplitude::HttpClient.post(URL, big)
+    assert_equal "gzip", captured.headers["Content-Encoding"]
+    raw = captured.body.b
+    assert_equal "\x1F\x8B".b, raw[0, 2]                         # gzip magic
+    assert_operator raw.bytesize, :<, big.bytesize               # actually smaller
+    assert_equal big, Zlib::GzipReader.new(StringIO.new(raw)).read
+  end
+
+  def test_gzip_can_be_disabled
+    captured = nil
+    stub_request(:post, URL).with { |req| captured = req; true }
+      .to_return(status: 200, body: "{}")
+
+    big = "x" * 4096
+    Ramplitude::HttpClient.post(URL, big, gzip: false)
+    assert_nil captured.headers["Content-Encoding"]
+    assert_equal big, captured.body
+  end
+
+  def test_gzipped_response_body_is_decoded
+    body = { "code" => 200, "ok" => true }.to_json
+    gz   = StringIO.new(+"".b)
+    Zlib::GzipWriter.new(gz).tap { |w| w.write(body); w.close }
+    stub_request(:post, URL).to_return(
+      status:  200,
+      body:    gz.string,
+      headers: { "Content-Encoding" => "gzip" },
+    )
+    res = Ramplitude::HttpClient.post(URL, "{}")
+    assert_equal Ramplitude::HttpStatus::SUCCESS, res.status
+    assert_equal true, res.body["ok"]
+  end
 end
