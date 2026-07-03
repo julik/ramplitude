@@ -26,25 +26,26 @@ module Ramplitude
 
     def stop = flush
 
-    # Helper: split into batches and send them sequentially. Override for
-    # concurrency.
+    # Helper: chunk events into limit-safe payloads and send them sequentially.
+    # Override for concurrency.
     def send_batches(events)
-      batch_size = @config.flush_queue_size
-      events.each_slice(batch_size) { |batch| send_one(batch) }
+      each_chunk(events) { |body, batch| send_one(body, batch) }
     end
 
-    def send_one(batch)
-      payload = build_payload(batch)
-      res = HttpClient.post(@config.server_url, payload)
+    def send_one(body, batch)
+      res = HttpClient.post(@config.server_url, body)
       @processor.process(res, batch)
     rescue InvalidAPIKeyError
       @config.logger&.error("Invalid Ramplitude API key")
     end
 
-    def build_payload(events)
-      body = { "api_key" => @config.api_key, "events" => events.map(&:to_h) }
-      body["options"] = @config.options if @config.options
-      JSON.generate(body)
+    def each_chunk(events, &block)
+      @config.chunker.each_chunk(
+        events,
+        api_key: @config.api_key,
+        options: @config.options,
+        &block
+      )
     end
   end
 

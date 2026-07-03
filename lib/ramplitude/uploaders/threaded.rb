@@ -29,10 +29,9 @@ module Ramplitude
         events = @sink.pull_all
         return NoopFuture.new if events.empty?
         ensure_started
-        future = ThreadedFuture.new(events.size)
-        events.each_slice(@config.flush_queue_size) do |batch|
-          @work_queue << [batch, future]
-        end
+        chunks = each_chunk(events).to_a
+        future = ThreadedFuture.new(chunks.size)
+        chunks.each { |body, batch| @work_queue << [body, batch, future] }
         future
       end
 
@@ -56,9 +55,9 @@ module Ramplitude
           loop do
             item = @work_queue.pop
             break if item == :stop
-            batch, future = item
+            body, batch, future = item
             begin
-              send_one(batch)
+              send_one(body, batch)
             rescue StandardError => e
               @config.logger&.error("Uploader worker error: #{e.class}: #{e.message}")
             ensure
@@ -74,8 +73,9 @@ module Ramplitude
           if @sink.size > 0
             batch = @sink.pull(max: @config.flush_queue_size)
             if batch.any?
-              future = ThreadedFuture.new(1)
-              @work_queue << [batch, future]
+              chunks = each_chunk(batch).to_a
+              future = ThreadedFuture.new(chunks.size)
+              chunks.each { |body, evts| @work_queue << [body, evts, future] }
             end
           end
           @sink.wait(timeout_ms: @config.flush_interval_ms)

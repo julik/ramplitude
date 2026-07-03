@@ -16,7 +16,8 @@ module Ramplitude
                   :plan,
                   :ingestion_metadata,
                   :sink,                    # Ramplitude::Sink instance (optional)
-                  :uploader                 # Ramplitude::Uploader instance (optional)
+                  :uploader,                # Ramplitude::Uploader instance (optional)
+                  :chunker                  # Ramplitude::Chunker instance (optional)
 
     def initialize(api_key: nil,
                    flush_queue_size:  Constants::FLUSH_QUEUE_SIZE,
@@ -31,7 +32,8 @@ module Ramplitude
                    sink:              nil,
                    uploader:          nil,
                    plan:              nil,
-                   ingestion_metadata: nil)
+                   ingestion_metadata: nil,
+                   chunker:           nil)
       @api_key            = api_key
       @flush_queue_size   = flush_queue_size
       @flush_size_divider = 1
@@ -48,6 +50,13 @@ module Ramplitude
       @opt_out            = false
       @plan               = plan
       @ingestion_metadata = ingestion_metadata
+      @chunker            = chunker
+    end
+
+    # Falls back to the chunker appropriate for the selected endpoint. Callers
+    # can inject their own via `chunker=` (e.g. tighter limits, custom pack).
+    def chunker
+      @chunker ||= @use_batch ? Chunkers::Batch.new : Chunkers::HttpV2.new
     end
 
     def flush_queue_size = [1, @flush_queue_size / @flush_size_divider].max

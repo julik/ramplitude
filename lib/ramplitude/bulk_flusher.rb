@@ -27,11 +27,14 @@ module Ramplitude
       sent = 0
       batches = 0
       while batches < max_batches
-        batch = @sink.pull(max: @config.flush_queue_size)
-        break if batch.empty?
-        send_batch(batch)
-        sent += batch.size
-        batches += 1
+        pulled = @sink.pull(max: @config.flush_queue_size)
+        break if pulled.empty?
+        each_chunk(pulled) do |body, batch|
+          break if batches >= max_batches
+          send_batch(body, batch)
+          sent += batch.size
+          batches += 1
+        end
       end
       sent
     end
@@ -39,19 +42,23 @@ module Ramplitude
     # Drain everything regardless of delay (used by shutdown jobs).
     def drain_all
       events = @sink.pull_all
-      events.each_slice(@config.flush_queue_size) { |b| send_batch(b) }
+      each_chunk(events) { |body, batch| send_batch(body, batch) }
       events.size
     end
 
     private
 
-    def send_batch(batch)
-      payload = JSON.generate(
-        "api_key" => @config.api_key,
-        "events"  => batch.map(&:to_h),
-        **(@config.options ? { "options" => @config.options } : {})
+    def each_chunk(events, &block)
+      @config.chunker.each_chunk(
+        events,
+        api_key: @config.api_key,
+        options: @config.options,
+        &block
       )
-      res = HttpClient.post(@config.server_url, payload)
+    end
+
+    def send_batch(body, batch)
+      res = HttpClient.post(@config.server_url, body)
       @processor.process(res, batch)
     rescue InvalidAPIKeyError
       @config.logger&.error("Invalid Ramplitude API key — dropping batch of #{batch.size}")
