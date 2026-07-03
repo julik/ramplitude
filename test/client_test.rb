@@ -131,12 +131,22 @@ class ClientTest < Minitest::Test
     assert_equal "web", received["events"].first["platform"]
   end
 
-  def test_event_without_user_or_device_id_is_dropped
+  def test_event_without_user_or_device_id_raises
     stub = stub_request(:post, URL).to_return(status: 200, body: "{}")
     client = build_client
-    client.track("No IDs")
+    err = assert_raises(Ramplitude::InvalidEventError) { client.track("No IDs") }
+    assert_match(/user_id/, err.message)
+    assert_match(/device_id/, err.message)
     client.flush.wait
     assert_not_requested stub
+  end
+
+  def test_enrich_can_supply_identity_before_the_check
+    stub_request(:post, URL).to_return(status: 200, body: "{}")
+    client = build_client
+    client.enrich { |e| e.user_id ||= "from-enricher"; e }
+    client.track("No IDs at call site")   # must not raise
+    client.flush.wait
   end
 
   def test_use_batch_routes_to_batch_endpoint

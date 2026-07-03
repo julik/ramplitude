@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "json"
+
 module Ramplitude
   # Three-stage plugin pipeline. Each stage is locked separately.
   # Destination plugins always receive a deep copy of the event.
@@ -29,6 +31,7 @@ module Ramplitude
       return event if @config&.opt_out
       e = apply(PluginType::BEFORE, event)
       e = apply(PluginType::ENRICHMENT, e)
+      require_identity!(e) if e
       apply(PluginType::DESTINATION, e)
       e
     end
@@ -51,6 +54,27 @@ module Ramplitude
     end
 
     private
+
+    # Amplitude ingestion rejects any event lacking both user_id and device_id.
+    # Enforce it locally so callers get a stack trace at the track site instead
+    # of a silent server-side rejection surfacing much later via `on_event`.
+    def require_identity!(event)
+      return if present?(event.user_id) || present?(event.device_id)
+      raise InvalidEventError, <<~MSG
+        Event rejected — neither user_id nor device_id is set after
+        enrichment, but Amplitude requires at least one of them on every event.
+
+        Event #{event.event_type.inspect} as it would have been sent:
+        #{JSON.pretty_generate(event.to_h)}
+
+        To remediate:
+          * Pass user_id: / device_id: when calling track.
+          * Or register an ENRICHMENT plugin that fills one in from your
+            request context (e.g. ActiveSupport::CurrentAttributes).
+      MSG
+    end
+
+    def present?(v) = !v.nil? && !(v.respond_to?(:empty?) && v.empty?)
 
     def apply(type, event)
       result = event

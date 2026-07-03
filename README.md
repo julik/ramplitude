@@ -181,6 +181,32 @@ amplitude.before  { |e| e.platform ||= "web"; e }
 amplitude.enrich  { |e| e.event_properties&.delete(:email); e }
 ```
 
+### Stamping `user_id` from `Current` in a Rails app
+
+Enrichment runs on the same thread as `track`, so `ActiveSupport::CurrentAttributes` is still populated. Register an enricher once at boot and drop the per-call `user_id:` argument from your app code.
+
+```ruby
+# app/models/current.rb
+class Current < ActiveSupport::CurrentAttributes
+  attribute :user, :visitor_id
+end
+
+# config/initializers/ramplitude.rb
+Ramplitude.configure do |c|
+  c.api_key = Rails.application.credentials.amplitude_api_key
+end
+
+Ramplitude.default_client.enrich do |event|
+  event.user_id   ||= Current.user&.id&.to_s
+  event.device_id ||= Current.visitor_id   # cookie-backed anon id from your frontend
+  event                                    # must return the event
+end
+```
+
+Now controllers just do `Ramplitude.track("Signed up")` — no need to pass `user_id:` at every call site.
+
+If **both** `user_id` and `device_id` are still blank after all enrichment plugins have run, `track` raises `Ramplitude::InvalidEventError` at the call site. That way a misconfigured `Current` surfaces immediately in dev / tests instead of silently reaching Amplitude and being rejected there.
+
 ## Layout
 
 See `llm/plans/port-plan.md` for the full module map and porting plan.
