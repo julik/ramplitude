@@ -58,10 +58,25 @@ module Ramplitude
     end
 
     def send_batch(body, batch)
+      completed = false
       res = HttpClient.post(@config.server_url, body)
       @processor.process(res, batch)
+      completed = true
     rescue InvalidAPIKeyError
+      completed = true
       @config.logger&.error("Invalid Ramplitude API key — dropping batch of #{batch.size}")
+    ensure
+      requeue_on_crash(batch) unless completed
+    end
+
+    def requeue_on_crash(batch)
+      batch.each do |event|
+        begin
+          @sink.push(event, delay_ms: 0)
+        rescue StandardError => e
+          @config.logger&.error("Sink push failed while requeueing after crash: #{e.class}: #{e.message}")
+        end
+      end
     end
   end
 end

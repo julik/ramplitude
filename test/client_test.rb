@@ -164,4 +164,28 @@ class ClientTest < Minitest::Test
 
     assert_requested :post, "https://api2.amplitude.com/batch"
   end
+
+  # Simulates a mid-flush crash (e.g. Timeout::Error slipping past HttpClient's
+  # rescues, or a bug in the response processor). The batch was already pulled
+  # from the sink — the ensure block must push it back so the next drain sees
+  # it, otherwise events are silently lost.
+  def test_send_one_requeues_batch_when_unexpected_error_is_raised
+    sink = Ramplitude::Sinks::InMemory.new
+    cfg  = Ramplitude::Config.new(api_key: "test-key")
+    sink.setup(cfg)
+    uploader = Ramplitude::Uploaders::Manual.new
+    uploader.setup(cfg, sink)
+
+    event = Ramplitude::Event.new(event_type: "X", user_id: "u-1")
+    boom  = Class.new(StandardError)
+
+    Ramplitude::HttpClient.stub(:post, ->(_url, _body) { raise boom, "kaboom" }) do
+      assert_raises(boom) { uploader.send_one("body", [event]) }
+    end
+
+    # Event must have been pushed back into the sink.
+    assert_equal 1, sink.size
+    pulled = sink.pull_all
+    assert_equal "u-1", pulled.first.user_id
+  end
 end

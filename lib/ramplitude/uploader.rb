@@ -33,10 +33,30 @@ module Ramplitude
     end
 
     def send_one(body, batch)
+      completed = false
       res = HttpClient.post(@config.server_url, body)
       @processor.process(res, batch)
+      completed = true
     rescue InvalidAPIKeyError
+      # Bad key won't get better on retry — drop the batch on purpose.
+      completed = true
       @config.logger&.error("Invalid Ramplitude API key")
+    ensure
+      requeue_on_crash(batch) unless completed
+    end
+
+    # If we pulled events from the sink and then something unexpected blew up
+    # before ResponseProcessor could take ownership of them (bug, Timeout::Error
+    # escaping HttpClient, thread interrupt, …) push them back so the next
+    # drain picks them up. Best-effort — a broken sink can still lose data.
+    def requeue_on_crash(batch)
+      batch.each do |event|
+        begin
+          @sink.push(event, delay_ms: 0)
+        rescue StandardError => e
+          @config.logger&.error("Sink push failed while requeueing after crash: #{e.class}: #{e.message}")
+        end
+      end
     end
 
     def each_chunk(events, &block)

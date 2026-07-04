@@ -27,6 +27,17 @@ module Ramplitude
         return items
       LUA
 
+      # ZRANGE + ZREM in one atomic step so producers pushing between the
+      # two commands can't have their events silently deleted.
+      PULL_ALL_LUA = <<~LUA
+        local key   = KEYS[1]
+        local items = redis.call('ZRANGE', key, 0, -1)
+        if #items > 0 then
+          redis.call('ZREM', key, unpack(items))
+        end
+        return items
+      LUA
+
       # Wraps a bare Redis client so it satisfies the ConnectionPool#with API.
       # Lets the sink treat pooled and unpooled clients uniformly.
       class NullPool
@@ -39,6 +50,7 @@ module Ramplitude
         @key       = key
         @capacity  = capacity
         @sha       = nil
+        @sha_all   = nil
         @seq       = 0
         @seq_mutex = Mutex.new
       end
@@ -63,12 +75,8 @@ module Ramplitude
       end
 
       def pull_all
-        all = with_redis do |r|
-          fetched = r.zrange(@key, 0, -1)
-          r.del(@key)
-          fetched
-        end
-        Array(all).map { |raw| deserialize(raw) }
+        items = eval_pull_all
+        items.map { |raw| deserialize(raw) }
       end
 
       def size = with_redis { |r| r.zcard(@key) }
@@ -103,6 +111,19 @@ module Ramplitude
           rescue ::Redis::CommandError => e
             raise unless e.message.include?("NOSCRIPT")
             @sha = r.script(:load, PULL_LUA)
+            retry
+          end
+        end
+      end
+
+      def eval_pull_all
+        with_redis do |r|
+          begin
+            @sha_all ||= r.script(:load, PULL_ALL_LUA)
+            Array(r.evalsha(@sha_all, keys: [@key]))
+          rescue ::Redis::CommandError => e
+            raise unless e.message.include?("NOSCRIPT")
+            @sha_all = r.script(:load, PULL_ALL_LUA)
             retry
           end
         end

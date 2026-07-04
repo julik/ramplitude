@@ -39,12 +39,20 @@ class FakeRedis
 
   def script(*); "fake-sha"; end
 
-  def evalsha(_sha, keys:, argv:)
+  def evalsha(_sha, keys:, argv: [])
     key = keys.first
-    now, max = argv.map(&:to_i)
-    due = @zsets[key].select { |_, s| s <= now }.sort_by { |_, s| s }.first(max).map(&:first)
-    due.each { |m| @zsets[key].delete(m) }
-    due
+    if argv.empty?
+      # PULL_ALL_LUA: atomic ZRANGE + ZREM
+      all = @zsets[key].sort_by { |_, s| s }.map(&:first)
+      @zsets[key].clear
+      all
+    else
+      # PULL_LUA: bounded ZRANGEBYSCORE + ZREM
+      now, max = argv.map(&:to_i)
+      due = @zsets[key].select { |_, s| s <= now }.sort_by { |_, s| s }.first(max).map(&:first)
+      due.each { |m| @zsets[key].delete(m) }
+      due
+    end
   end
 end
 
@@ -83,6 +91,16 @@ class RedisSinkBareClientTest < Minitest::Test
 
   def test_pull_all_drains_everything
     3.times { |i| @sink.push(Ramplitude::Event.new(event_type: "X", user_id: "u#{i}")) }
+    drained = @sink.pull_all
+    assert_equal 3, drained.size
+    assert_equal 0, @sink.size
+  end
+
+  def test_pull_all_uses_evalsha_not_separate_zrange_and_del
+    # If pull_all reverted to ZRANGE + DEL, a client that doesn't implement
+    # `del` would blow up. This confirms the atomic Lua path is taken.
+    3.times { |i| @sink.push(Ramplitude::Event.new(event_type: "X", user_id: "u#{i}")) }
+    @fake.define_singleton_method(:del) { |*| raise "pull_all should not call del directly" }
     drained = @sink.pull_all
     assert_equal 3, drained.size
     assert_equal 0, @sink.size
