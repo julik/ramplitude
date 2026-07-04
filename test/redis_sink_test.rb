@@ -96,6 +96,27 @@ class RedisSinkBareClientTest < Minitest::Test
     assert_equal 0, @sink.size
   end
 
+  def test_push_refuses_above_hard_max_backlog
+    sink = Ramplitude::Sinks::Redis.new(redis: @fake, key: "amp:cap", hard_max_backlog: 3)
+    sink.setup(@cfg)
+    3.times { |i| assert_equal [true, nil], sink.push(Ramplitude::Event.new(event_type: "X", user_id: "u#{i}")) }
+    accepted, msg = sink.push(Ramplitude::Event.new(event_type: "X", user_id: "u-4"))
+    refute accepted
+    assert_match(/hard cap/, msg)
+    assert_equal 3, sink.size
+  end
+
+  def test_hard_max_backlog_applies_to_retries_too
+    sink = Ramplitude::Sinks::Redis.new(redis: @fake, key: "amp:cap", hard_max_backlog: 2)
+    sink.setup(@cfg)
+    2.times { |i| sink.push(Ramplitude::Event.new(event_type: "X", user_id: "u#{i}")) }
+    retryable = Ramplitude::Event.new(event_type: "X", user_id: "u-retry")
+    retryable.retry_count = 1
+    accepted, msg = sink.push(retryable)
+    refute accepted
+    assert_match(/hard cap/, msg)
+  end
+
   def test_pull_all_uses_evalsha_not_separate_zrange_and_del
     # If pull_all reverted to ZRANGE + DEL, a client that doesn't implement
     # `del` would blow up. This confirms the atomic Lua path is taken.

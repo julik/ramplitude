@@ -45,19 +45,32 @@ module Ramplitude
         def with               = yield(@client)
       end
 
-      def initialize(redis:, key: "amplitude:events", capacity: Constants::MAX_BUFFER_CAPACITY)
-        @pool      = redis.respond_to?(:with) ? redis : NullPool.new(redis)
-        @key       = key
-        @capacity  = capacity
-        @sha       = nil
-        @sha_all   = nil
-        @seq       = 0
-        @seq_mutex = Mutex.new
+      # Hard ceiling on how many events the ZSET is allowed to hold. Above this,
+      # `push` refuses regardless of retry_count so a stuck uploader (bad key,
+      # Amplitude outage, network partition) can't run producers into Redis OOM.
+      # Configurable via the `hard_max_backlog:` kwarg.
+      HARD_MAX_BACKLOG = 10_000_000
+
+      def initialize(redis:, key: "amplitude:events",
+                     capacity: Constants::MAX_BUFFER_CAPACITY,
+                     hard_max_backlog: HARD_MAX_BACKLOG)
+        @pool             = redis.respond_to?(:with) ? redis : NullPool.new(redis)
+        @key              = key
+        @capacity         = capacity
+        @hard_max_backlog = hard_max_backlog
+        @sha              = nil
+        @sha_all          = nil
+        @seq              = 0
+        @seq_mutex        = Mutex.new
       end
 
       def push(event, delay_ms: 0)
         return [false, "Event reached max retry #{max_retries}"] if event.retry_count >= max_retries
-        if event.retry_count > 0 && size >= @capacity
+        current_size = size
+        if current_size >= @hard_max_backlog
+          return [false, "Sink backlog above hard cap (#{@hard_max_backlog}); refusing write"]
+        end
+        if event.retry_count > 0 && current_size >= @capacity
           return [false, "Sink full; retry temporarily disabled"]
         end
 
